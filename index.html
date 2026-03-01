@@ -511,6 +511,19 @@ body {
     <button class="theme-toggle" id="themeBtn" onclick="toggleTheme()" title="Toggle light/dark">
       <span id="themeIcon">☀️</span>
     </button>
+
+    <select id="refreshSelect" onchange="setAutoRefresh(this.value)" title="Auto-refresh interval"
+      style="background:var(--bg3);border:1px solid var(--border2);color:var(--text2);
+             font-family:'Inter',sans-serif;font-size:11px;padding:5px 8px;border-radius:4px;
+             cursor:pointer;outline:none;transition:all var(--transition)">
+      <option value="0">No auto-refresh</option>
+      <option value="5">Refresh every 5 min</option>
+      <option value="15">Refresh every 15 min</option>
+      <option value="30" selected>Refresh every 30 min</option>
+      <option value="60">Refresh every 1 hr</option>
+      <option value="360">Refresh every 6 hr</option>
+    </select>
+
     <div class="status-pill pill-idle" id="statusPill">
       <div class="dot"></div>
       <span id="statusText">Standby</span>
@@ -921,6 +934,12 @@ async function loadAll() {
   setProgress(100);
   document.getElementById('btnLoad').disabled = false;
   startClock();
+  // Start auto-refresh if a non-zero interval is selected
+  const sel = document.getElementById('refreshSelect');
+  if (sel && parseInt(sel.value) > 0) {
+    refreshMinutes = parseInt(sel.value);
+    scheduleRefresh();
+  }
   setTimeout(() => setProgress(0), 1000);
 }
 
@@ -1189,12 +1208,15 @@ function hideToast() {
 }
 
 // ═══════════════════════════════════════════════════════════════
-// LIVE CLOCK
+// LIVE CLOCK + AUTO-REFRESH
 // ═══════════════════════════════════════════════════════════════
-let clockInterval = null;
+let clockInterval   = null;
+let refreshInterval = null;
+let nextRefreshAt   = null;
+let refreshMinutes  = 30; // default
 
 function startClock() {
-  tickClock(); // immediate first tick
+  tickClock();
   if (clockInterval) clearInterval(clockInterval);
   clockInterval = setInterval(tickClock, 1000);
 }
@@ -1204,8 +1226,93 @@ function tickClock() {
   const hh  = String(now.getHours()).padStart(2,'0');
   const mm  = String(now.getMinutes()).padStart(2,'0');
   const ss  = String(now.getSeconds()).padStart(2,'0');
-  const timeStr = hh + ':' + mm + ':' + ss;
-  setStatus('live', 'Live · ' + timeStr);
+
+  let label = 'Live · ' + hh + ':' + mm + ':' + ss;
+
+  // Show countdown to next refresh
+  if (nextRefreshAt && refreshMinutes > 0) {
+    const secsLeft = Math.max(0, Math.round((nextRefreshAt - now) / 1000));
+    const mLeft    = Math.floor(secsLeft / 60);
+    const sLeft    = secsLeft % 60;
+    if (secsLeft > 0) {
+      label += '  ·  ↻ ' + (mLeft > 0 ? mLeft + 'm ' : '') + sLeft + 's';
+    }
+  }
+
+  setStatus('live', label);
+}
+
+function setAutoRefresh(minutes) {
+  refreshMinutes = parseInt(minutes);
+  if (refreshInterval) { clearInterval(refreshInterval); refreshInterval = null; }
+  nextRefreshAt = null;
+
+  if (refreshMinutes > 0 && loaded) {
+    scheduleRefresh();
+  }
+
+  // save preference
+  try { localStorage.setItem('fred-refresh', minutes); } catch(e) {}
+}
+
+function scheduleRefresh() {
+  if (refreshInterval) clearInterval(refreshInterval);
+  const ms = refreshMinutes * 60 * 1000;
+  nextRefreshAt = new Date(Date.now() + ms);
+  refreshInterval = setInterval(async () => {
+    if (!loaded || !apiKey) return;
+    showToast('Auto-refreshing data from FRED…', 'info');
+    await silentRefresh();
+    nextRefreshAt = new Date(Date.now() + ms); // reset countdown
+  }, ms);
+}
+
+async function silentRefresh() {
+  // Re-fetch all series without showing skeletons — just update existing charts
+  const all = Object.values(SERIES).flat();
+  let updated = 0;
+  for (const chunk of chunked(all, 5)) {
+    await Promise.allSettled(chunk.map(async s => {
+      try {
+        const obs = await fetchSeries(s.id);
+        const newDates = obs.map(o => o.date);
+        const newVals  = obs.map(o => o.val);
+        // Check if data actually changed
+        const old = dataSt[s.id];
+        const hasNew = !old || newDates[newDates.length-1] !== old.dates[old.dates.length-1];
+        dataSt[s.id] = { dates: newDates, vals: newVals };
+        // Always redraw with latest range
+        redrawChart(s);
+        // Update value displays
+        const valEl   = document.getElementById('val-' + s.id);
+        const deltaEl = document.getElementById('delta-' + s.id);
+        const yoyEl   = document.getElementById('yoy-' + s.id);
+        const dateEl  = document.getElementById('date-' + s.id);
+        const latest  = newVals[newVals.length-1];
+        const prev    = newVals[newVals.length-2];
+        const delta   = latest - prev;
+        if (valEl) valEl.textContent = fmtVal(latest, s);
+        if (dateEl) dateEl.textContent = 'Latest: ' + newDates[newDates.length-1];
+        if (deltaEl) {
+          const up  = delta >= 0;
+          const cls = Math.abs(delta) < 0.001 ? 'c-text2' : (up ? 'c-green' : 'c-red');
+          const arr = Math.abs(delta) < 0.001 ? '—' : (up ? '▲' : '▼');
+          deltaEl.innerHTML = `<span class="${cls}">${arr} ${Math.abs(delta).toFixed(2)} MoM</span>`;
+        }
+        if (s.yoy && newVals.length >= 13 && yoyEl) {
+          const yoy = ((newVals[newVals.length-1]/newVals[newVals.length-13]-1)*100).toFixed(1);
+          const cls = parseFloat(yoy) > 0 ? 'c-green' : 'c-red';
+          yoyEl.innerHTML = `YoY: <span class="${cls}">${yoy > 0 ? '+' : ''}${yoy}%</span>`;
+        }
+        updateKPI(s, newVals);
+        if (hasNew) updated++;
+      } catch(e) { /* silently skip on auto-refresh errors */ }
+    }));
+  }
+  const msg = updated > 0
+    ? `↻ Refreshed — ${updated} series updated with new data`
+    : '↻ Refreshed — all series up to date (no new releases)';
+  showToast(msg, 'ok');
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -1218,8 +1325,13 @@ Chart.defaults.color = '#4c525e';
 // RESTORE SAVED KEY
 // ═══════════════════════════════════════════════════════════════
 try {
-  const saved = localStorage.getItem('fred-key');
-  if (saved) document.getElementById('apiKey').value = saved;
+  const savedKey = localStorage.getItem('fred-key');
+  if (savedKey) document.getElementById('apiKey').value = savedKey;
+  const savedRefresh = localStorage.getItem('fred-refresh');
+  if (savedRefresh) {
+    document.getElementById('refreshSelect').value = savedRefresh;
+    refreshMinutes = parseInt(savedRefresh);
+  }
 } catch(e) {}
 
 document.getElementById('apiKey').addEventListener('change', e => {
