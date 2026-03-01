@@ -794,6 +794,508 @@ function toggleTheme() {
   theme = theme === 'dark' ? 'light' : 'dark';
   applyTheme(theme);
   localStorage.setItem('fred-theme', theme);
+  if (loaded) setTimeout(() => {
+    Object.values(SERIES).flat().forEach(s => { if (dataSt[s.id]) rebuildChart(s); });
+  }, 100);
+}
+
+function applyTheme(t) {
+  document.documentElement.setAttribute('data-theme', t);
+  document.getElementById('themeIcon').textContent = t === 'dark' ? '☀️' : '🌙';
+  // Update Chart.js defaults
+  const gridCol = t === 'dark' ? 'rgba(255,255,255,0.04)' : 'rgba(0,0,0,0.04)';
+  const tickCol = t === 'dark' ? '#4c525e' : '#b2b5be';
+  Chart.defaults.color = tickCol;
+  if (loaded) setTimeout(() => redrawAll(), 50);
+}
+
+// ═══════════════════════════════════════════════════════════════
+// NAVIGATION
+// ═══════════════════════════════════════════════════════════════
+function switchTab(tab, btn) {
+  document.querySelectorAll('.nav-item[onclick^="switchTab"]').forEach(b => b.classList.remove('active'));
+  document.querySelectorAll('.section').forEach(s => s.classList.remove('active'));
+  btn.classList.add('active');
+  document.getElementById('section-' + tab).classList.add('active');
+  document.getElementById('welcomeState').style.display = 'none';
+  activeTab = tab;
+  if (loaded) SERIES[tab].forEach(s => { if (dataSt[s.id]) redrawChart(s); });
+}
+
+function setRange(m, btn) {
+  document.querySelectorAll('#sideRanges .nav-item').forEach(b => b.classList.remove('active'));
+  btn.classList.add('active');
+  months = m;
+  if (loaded) redrawAll();
+}
+
+function redrawAll() {
+  Object.values(SERIES).flat().forEach(s => { if (dataSt[s.id]) redrawChart(s); });
+}
+
+// ═══════════════════════════════════════════════════════════════
+// FETCH
+// ═══════════════════════════════════════════════════════════════
+function fredJsonp(seriesId) {
+  return new Promise((resolve, reject) => {
+    const cb = 'fc_' + seriesId.replace(/[^a-zA-Z0-9]/g,'_') + '_' + Date.now();
+    const p  = `series_id=${seriesId}&api_key=${apiKey}&file_type=json&sort_order=asc&limit=800&observation_start=1985-01-01&callback=${cb}`;
+    const el = document.createElement('script');
+    el.src   = 'https://api.stlouisfed.org/fred/series/observations?' + p;
+    const t  = setTimeout(() => { cleanup(); reject(new Error('Timeout')); }, 15000);
+    window[cb] = d => { cleanup(); resolve(d); };
+    el.onerror  = () => { cleanup(); reject(new Error('Load failed')); };
+    function cleanup(){ clearTimeout(t); try{delete window[cb];}catch(e){} if(el.parentNode) el.parentNode.removeChild(el); }
+    document.head.appendChild(el);
+  });
+}
+
+function fredFetch(seriesId) {
+  return new Promise((resolve, reject) => {
+    const p = `series_id=${seriesId}&api_key=${apiKey}&file_type=json&sort_order=asc&limit=800&observation_start=1985-01-01`;
+    const t = setTimeout(() => reject(new Error('Timeout')), 15000);
+    fetch('https://api.stlouisfed.org/fred/series/observations?' + p)
+      .then(r => r.json())
+      .then(d => { clearTimeout(t); resolve(d); })
+      .catch(e => { clearTimeout(t); reject(e); });
+  });
+}
+
+async function fetchSeries(id) {
+  let d;
+  try { d = await fredJsonp(id); }
+  catch(e) {
+    try { d = await fredFetch(id); }
+    catch(e2) { throw new Error('Failed to fetch — run via local server or hosted URL'); }
+  }
+  if (!d) throw new Error('No response');
+  if (d.error_message) throw new Error(d.error_message);
+  if (!Array.isArray(d.observations)) throw new Error('Unexpected format');
+  const obs = d.observations.filter(o => o.value !== '.').map(o => ({ date:o.date, val:parseFloat(o.value) }));
+  if (!obs.length) throw new Error('No data');
+  return obs;
+}
+
+// ═══════════════════════════════════════════════════════════════
+// LOAD ALL
+// ═══════════════════════════════════════════════════════════════
+async function loadAll() {
+  const raw = document.getElementById('apiKey').value.trim();
+  if (!raw) { showToast('Please enter your FRED API key', 'err'); return; }
+  const key = raw.replace(/\s/g,'');
+  if (key.length !== 32 || !/^[a-f0-9]+$/i.test(key)) {
+    showToast(`Invalid key — expected 32 hex chars, got ${raw.length}`, 'err'); return;
+  }
+  apiKey = key;
+
+  document.getElementById('btnLoad').disabled = true;
+  const ws = document.getElementById('welcomeState');
+  if (ws) { ws.style.display = 'none'; ws.remove(); } // fully remove to prevent any leakage
+  setStatus('loading', 'Loading…');
+  setProgress(4);
+
+  // Show active tab section
+  document.getElementById('section-' + activeTab).classList.add('active');
+
+  // Build all skeletons
+  Object.keys(SERIES).forEach(tab => buildGrid(tab));
+
+  const all = Object.values(SERIES).flat();
+  let done = 0;
+
+  // Load 5 at a time
+  for (const chunk of chunked(all, 5)) {
+    await Promise.allSettled(chunk.map(async s => {
+      try {
+        const obs = await fetchSeries(s.id);
+        dataSt[s.id] = { dates: obs.map(o=>o.date), vals: obs.map(o=>o.val) };
+        renderCard(s);
+        updateKPI(s, dataSt[s.id].vals);
+      } catch(e) { showError(s.id, e.message); }
+      done++;
+      setProgress(4 + Math.round(done / all.length * 93));
+    }));
+  }
+
+  loaded = true;
+  setProgress(100);
+  document.getElementById('btnLoad').disabled = false;
+  startClock();
+  setTimeout(() => setProgress(0), 1000);
+}
+
+function chunked(arr, n) {
+  const out = [];
+  for (let i=0; i<arr.length; i+=n) out.push(arr.slice(i,i+n));
+  return out;
+}
+
+// ═══════════════════════════════════════════════════════════════
+// GRID / SKELETON
+// ═══════════════════════════════════════════════════════════════
+function buildGrid(tab) {
+  document.getElementById('grid-' + tab).innerHTML = SERIES[tab].map(s => `
+    <div class="card" id="card-${s.id}">
+      <div class="card-top">
+        <div class="card-left">
+          <div class="card-series">${s.id}</div>
+          <div class="card-title">${s.title}</div>
+          <div class="card-desc">${s.desc}</div>
+        </div>
+        <div class="card-right">
+          <div class="card-val" id="val-${s.id}">--</div>
+          <div class="card-unit">${s.unit}</div>
+          <div class="card-delta" id="delta-${s.id}"></div>
+          <div class="card-yoy"  id="yoy-${s.id}"></div>
+        </div>
+      </div>
+      <div class="card-divider"></div>
+      <div class="card-chart">
+        <div id="state-${s.id}" class="card-state">
+          <div class="card-spinner" style="border-top-color:${s.color}"></div>
+          <div class="card-state-text">Loading ${s.id}…</div>
+        </div>
+        <div class="chart-canvas-wrap" id="wrap-${s.id}" style="display:none">
+          <canvas id="chart-${s.id}"></canvas>
+        </div>
+      </div>
+      <div class="card-footer">
+        <div class="card-date" id="date-${s.id}"></div>
+        <div class="card-freq">${s.freq}</div>
+      </div>
+    </div>
+  `).join('');
+}
+
+function showError(id, msg) {
+  const el = document.getElementById('state-' + id);
+  if (!el) return;
+  el.innerHTML = `
+    <div class="card-error-msg">⚠ ${msg}</div>
+    <div class="card-error-hint">Check API key · Series: ${id}</div>
+  `;
+}
+
+// ═══════════════════════════════════════════════════════════════
+// RENDER CHART
+// ═══════════════════════════════════════════════════════════════
+function renderCard(s) {
+  const { dates, vals } = dataSt[s.id];
+  const latest = vals[vals.length-1];
+  const prev   = vals[vals.length-2];
+  const delta  = latest - prev;
+
+  // Value display
+  const valEl   = document.getElementById('val-' + s.id);
+  const deltaEl = document.getElementById('delta-' + s.id);
+  const yoyEl   = document.getElementById('yoy-' + s.id);
+  const dateEl  = document.getElementById('date-' + s.id);
+
+  if (valEl) valEl.textContent = fmtVal(latest, s);
+
+  if (deltaEl && prev != null) {
+    const up = delta >= 0;
+    const cls = Math.abs(delta) < 0.001 ? 'c-text2' : (up ? 'c-green' : 'c-red');
+    const arrow = Math.abs(delta) < 0.001 ? '—' : (up ? '▲' : '▼');
+    deltaEl.innerHTML = `<span class="${cls}">${arrow} ${Math.abs(delta).toFixed(s.isRate ? 2 : 2)} MoM</span>`;
+  }
+
+  if (s.yoy && vals.length >= 13 && yoyEl) {
+    const yoy = ((vals[vals.length-1] / vals[vals.length-13] - 1) * 100).toFixed(1);
+    const cls  = parseFloat(yoy) > 0 ? 'c-green' : 'c-red';
+    yoyEl.innerHTML = `YoY: <span class="${cls}">${yoy > 0 ? '+' : ''}${yoy}%</span>`;
+  }
+
+  if (dateEl) dateEl.textContent = 'Latest: ' + dates[dates.length-1];
+
+  // Show chart
+  document.getElementById('state-' + s.id).style.display = 'none';
+  document.getElementById('wrap-' + s.id).style.display  = 'block';
+
+  buildChart(s, dates, vals);
+}
+
+function redrawChart(s) {
+  const d = dataSt[s.id];
+  if (!d) return;
+  const { dates, values } = sliceRange(d.dates, d.vals);
+  const ch = charts[s.id];
+  if (!ch) { buildChart(s, d.dates, d.vals); return; }
+  ch.data.labels = dates;
+  ch.data.datasets[0].data = values;
+  ch.update('none');
+}
+
+function rebuildChart(s) {
+  const d = dataSt[s.id];
+  if (!d) return;
+  if (charts[s.id]) { charts[s.id].destroy(); delete charts[s.id]; }
+  buildChart(s, d.dates, d.vals);
+}
+
+function buildChart(s, allDates, allVals) {
+  const { dates, values } = sliceRange(allDates, allVals);
+  const canvas = document.getElementById('chart-' + s.id);
+  if (!canvas) return;
+  if (charts[s.id]) { charts[s.id].destroy(); }
+
+  const isDark = theme === 'dark';
+  const gridColor = isDark ? 'rgba(255,255,255,0.04)' : 'rgba(0,0,0,0.05)';
+  const tickColor = isDark ? '#4c525e' : '#b2b5be';
+
+  const ctx  = canvas.getContext('2d');
+  const grad = ctx.createLinearGradient(0, 0, 0, 160);
+  grad.addColorStop(0, hexA(s.color, 0.2));
+  grad.addColorStop(1, hexA(s.color, 0.0));
+
+  charts[s.id] = new Chart(ctx, {
+    type: 'line',
+    data: {
+      labels: dates,
+      datasets: [{
+        data: values,
+        borderColor: s.color,
+        borderWidth: 1.5,
+        backgroundColor: grad,
+        fill: true,
+        tension: 0.3,
+        pointRadius: 0,
+        pointHoverRadius: 4,
+        pointHoverBackgroundColor: '#fff',
+        pointHoverBorderColor: s.color,
+        pointHoverBorderWidth: 2,
+      }]
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      animation: { duration: 500 },
+      interaction: { mode:'index', intersect:false },
+      plugins: {
+        legend: { display:false },
+        tooltip: {
+          backgroundColor: isDark ? '#1e222d' : '#ffffff',
+          borderColor: s.color,
+          borderWidth: 1,
+          titleColor: isDark ? '#787b86' : '#787b86',
+          bodyColor:  isDark ? '#d1d4dc' : '#131722',
+          titleFont: { family:'Inter', size:10, weight:'500' },
+          bodyFont:  { family:'JetBrains Mono', size:12, weight:'700' },
+          padding: 10,
+          cornerRadius: 6,
+          callbacks: {
+            title: i => i[0].label,
+            label: i => ' ' + fmtVal(i.raw, s) + ' ' + s.unit,
+          }
+        }
+      },
+      scales: {
+        x: {
+          grid: { color: gridColor, drawTicks:false },
+          ticks: { color:tickColor, font:{family:'JetBrains Mono',size:9}, maxTicksLimit:6, maxRotation:0 },
+          border: { display:false },
+        },
+        y: {
+          position: 'right',
+          grid: { color: gridColor, drawTicks:false },
+          ticks: { color:tickColor, font:{family:'JetBrains Mono',size:9}, maxTicksLimit:5, callback: v => fmtAxis(v,s) },
+          border: { display:false },
+          ...(s.id === 'T10Y2Y' || s.id === 'BOPGSTB' ? {} : { beginAtZero: false }),
+        }
+      }
+    }
+  });
+}
+
+// ═══════════════════════════════════════════════════════════════
+// KPI UPDATES
+// ═══════════════════════════════════════════════════════════════
+const KPI = {
+  FEDFUNDS:          { el:'hk-fedfunds', fn: v => v.toFixed(2)+'%' },
+  CPIAUCSL:          { el:'hk-cpi',      fn: (v, all) => all.length>=13 ? ((all[all.length-1]/all[all.length-13]-1)*100).toFixed(1)+'%' : v.toFixed(1), needsAll:true },
+  UNRATE:            { el:'hk-unrate',   fn: v => v.toFixed(1)+'%' },
+  A191RL1Q225SBEA:   { el:'hk-gdp',      fn: v => (v>0?'+':'')+v.toFixed(1)+'%' },
+  DGS10:             { el:'hk-10y',      fn: v => v.toFixed(2)+'%' },
+  PCEPI:             { el:'hk-pce',      fn: (v, all) => all.length>=13 ? ((all[all.length-1]/all[all.length-13]-1)*100).toFixed(1)+'%' : v.toFixed(1), needsAll:true },
+};
+
+function updateKPI(s, vals) {
+  const cfg = KPI[s.id];
+  if (!cfg) return;
+  const el = document.getElementById(cfg.el);
+  if (!el) return;
+  el.textContent = cfg.needsAll ? cfg.fn(vals[vals.length-1], vals) : cfg.fn(vals[vals.length-1]);
+}
+
+// ═══════════════════════════════════════════════════════════════
+// HELPERS
+// ═══════════════════════════════════════════════════════════════
+function sliceRange(dates, vals) {
+  if (months >= 9999) return { dates, values: vals };
+  const cut = new Date(); cut.setMonth(cut.getMonth() - months);
+  const cutStr = cut.toISOString().slice(0,10);
+  const i = dates.findIndex(d => d >= cutStr);
+  if (i < 0) return { dates, values: vals };
+  return { dates: dates.slice(i), values: vals.slice(i) };
+}
+
+function fmtVal(v, s) {
+  if (v == null) return '--';
+  if (s.isRate || s.unit === '%') return v.toFixed(2);
+  if (Math.abs(v) >= 1e9) return (v/1e9).toFixed(2)+'B';
+  if (Math.abs(v) >= 1e6) return (v/1e6).toFixed(2)+'M';
+  if (Math.abs(v) >= 1e3) return (v/1e3).toFixed(1)+'K';
+  return v.toFixed(2);
+}
+
+function fmtAxis(v, s) {
+  if (s.isRate || s.unit === '%') return v.toFixed(1);
+  if (Math.abs(v) >= 1e9) return (v/1e9).toFixed(0)+'B';
+  if (Math.abs(v) >= 1e6) return (v/1e6).toFixed(0)+'M';
+  if (Math.abs(v) >= 1e3) return (v/1e3).toFixed(0)+'K';
+  return v.toFixed(0);
+}
+
+function hexA(hex, a) {
+  const r=parseInt(hex.slice(1,3),16), g=parseInt(hex.slice(3,5),16), b=parseInt(hex.slice(5,7),16);
+  return `rgba(${r},${g},${b},${a})`;
+}
+
+function setProgress(p) {
+  document.getElementById('progress').style.width = p + '%';
+  if (p > 0 && p < 100) setStatus('loading', 'Loading ' + p + '%…');
+}
+
+function setStatus(type, text) {
+  const el = document.getElementById('statusPill');
+  const tx = document.getElementById('statusText');
+  el.className = 'status-pill pill-' + (type==='loading'?'loading': type==='live'?'live': type==='error'?'error':'idle');
+  tx.textContent = text;
+}
+
+let toastTimer;
+function showToast(msg, type='info') {
+  const el = document.getElementById('toast');
+  const ic = document.getElementById('toastIcon');
+  const mx = document.getElementById('toastMsg');
+  ic.textContent = type==='err' ? '⚠' : '✓';
+  mx.textContent = msg;
+  el.className = 'show ' + (type==='err' ? 'toast-err' : 'toast-ok');
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(hideToast, 6000);
+}
+function hideToast() {
+  document.getElementById('toast').classList.remove('show');
+}
+
+// ═══════════════════════════════════════════════════════════════
+// LIVE CLOCK
+// ═══════════════════════════════════════════════════════════════
+let clockInterval = null;
+
+function startClock() {
+  tickClock(); // immediate first tick
+  if (clockInterval) clearInterval(clockInterval);
+  clockInterval = setInterval(tickClock, 1000);
+}
+
+function tickClock() {
+  const now = new Date();
+  const hh  = String(now.getHours()).padStart(2,'0');
+  const mm  = String(now.getMinutes()).padStart(2,'0');
+  const ss  = String(now.getSeconds()).padStart(2,'0');
+  const timeStr = hh + ':' + mm + ':' + ss;
+  setStatus('live', 'Live · ' + timeStr);
+}
+
+// ═══════════════════════════════════════════════════════════════
+// CHART.JS GLOBAL DEFAULTS
+// ═══════════════════════════════════════════════════════════════
+Chart.defaults.font.family = 'JetBrains Mono';
+Chart.defaults.color = '#4c525e';
+
+// ═══════════════════════════════════════════════════════════════
+// RESTORE SAVED KEY
+// ═══════════════════════════════════════════════════════════════
+try {
+  const saved = localStorage.getItem('fred-key');
+  if (saved) document.getElementById('apiKey').value = saved;
+} catch(e) {}
+
+document.getElementById('apiKey').addEventListener('change', e => {
+  try { localStorage.setItem('fred-key', e.target.value.trim()); } catch(e) {}
+});
+</script>
+</body>
+</html>n measure",        yoy:true },
+    { id:'PCEPILFE',  title:'Core PCE (ex Food & Energy)',  unit:'Index',  color:'#ff5722', freq:'Monthly',   desc:'Core PCE — Fed 2% target benchmark',      yoy:true },
+    { id:'PPIACO',    title:'Producer Price Index (PPI)',    unit:'Index',  color:'#ffb300', freq:'Monthly',   desc:'All commodities — leading inflation signal' },
+  ],
+  labor: [
+    { id:'UNRATE',        title:'Unemployment Rate',              unit:'%',      color:'#26a69a', freq:'Monthly',   desc:'Civilian unemployment rate', isRate:true },
+    { id:'PAYEMS',        title:'Nonfarm Payrolls',               unit:'Thous',  color:'#4caf50', freq:'Monthly',   desc:'Total nonfarm employees, seasonally adj.' },
+    { id:'CIVPART',       title:'Labor Force Participation',      unit:'%',      color:'#66bb6a', freq:'Monthly',   desc:'% of civilian population in labor force', isRate:true },
+    { id:'CES0500000003', title:'Average Hourly Earnings',        unit:'$/hr',   color:'#81c784', freq:'Monthly',   desc:'All private employees' },
+    { id:'JTSJOL',        title:'Job Openings (JOLTS)',           unit:'Thous',  color:'#00acc1', freq:'Monthly',   desc:'Total job openings, all industries' },
+    { id:'ICSA',          title:'Initial Jobless Claims',         unit:'Thous',  color:'#26c6da', freq:'Weekly',    desc:'Initial unemployment insurance claims' },
+  ],
+  gdp: [
+    { id:'GDPC1',          title:'Real GDP',                      unit:'Bil.$',  color:'#2962ff', freq:'Quarterly', desc:'Real gross domestic product' },
+    { id:'A191RL1Q225SBEA',title:'Real GDP Growth Rate',          unit:'%',      color:'#448aff', freq:'Quarterly', desc:'% change from prior quarter, annualized', isRate:true },
+    { id:'INDPRO',         title:'Industrial Production Index',   unit:'Index',  color:'#40c4ff', freq:'Monthly',   desc:'Total industrial production' },
+    { id:'RSXFS',          title:'Retail Sales (ex Vehicles)',    unit:'Mil.$',  color:'#0091ea', freq:'Monthly',   desc:'Advance retail & food services ex-autos' },
+    { id:'UMCSENT',        title:'Consumer Sentiment (UMich)',    unit:'Index',  color:'#00b0ff', freq:'Monthly',   desc:'University of Michigan consumer sentiment' },
+  ],
+  rates: [
+    { id:'FEDFUNDS',    title:'Federal Funds Rate',               unit:'%',      color:'#9c27b0', freq:'Monthly',   desc:'Effective fed funds rate', isRate:true },
+    { id:'DGS10',       title:'10-Year Treasury Yield',           unit:'%',      color:'#ba68c8', freq:'Daily',     desc:'Constant maturity 10-year Treasury', isRate:true },
+    { id:'DGS2',        title:'2-Year Treasury Yield',            unit:'%',      color:'#ab47bc', freq:'Daily',     desc:'Constant maturity 2-year Treasury', isRate:true },
+    { id:'DGS30',       title:'30-Year Treasury Yield',           unit:'%',      color:'#7b1fa2', freq:'Daily',     desc:'Constant maturity 30-year Treasury', isRate:true },
+    { id:'T10Y2Y',      title:'Yield Curve (10Y − 2Y)',           unit:'%',      color:'#ce93d8', freq:'Daily',     desc:'Negative = inversion (recession signal)', isRate:true },
+    { id:'MORTGAGE30US',title:'30-Year Mortgage Rate',            unit:'%',      color:'#e040fb', freq:'Weekly',    desc:'30-year fixed rate mortgage average', isRate:true },
+  ],
+  housing: [
+    { id:'CSUSHPISA', title:'Case-Shiller Home Price Index',      unit:'Index',  color:'#e91e63', freq:'Monthly',   desc:'20-city composite home price index' },
+    { id:'HOUST',     title:'Housing Starts',                     unit:'Thous',  color:'#f06292', freq:'Monthly',   desc:'New privately owned housing units started' },
+    { id:'PERMIT',    title:'Building Permits',                   unit:'Thous',  color:'#f48fb1', freq:'Monthly',   desc:'New housing units authorized' },
+    { id:'MSPUS',     title:'Median Home Sale Price',             unit:'$',      color:'#c2185b', freq:'Quarterly', desc:'Median sales price of homes sold' },
+    { id:'RHORUSQ156N',title:'US Homeownership Rate',            unit:'%',      color:'#ad1457', freq:'Quarterly', desc:'Homeownership rate, seasonally adjusted', isRate:true },
+  ],
+  credit: [
+    { id:'TOTALSL',     title:'Total Consumer Credit',           unit:'Bil.$',  color:'#ff5722', freq:'Monthly',   desc:'Total outstanding consumer credit' },
+    { id:'DRCCLACBS',   title:'Credit Card Delinquency Rate',    unit:'%',      color:'#ff7043', freq:'Quarterly', desc:'Credit cards 30+ days past due', isRate:true },
+    { id:'M2SL',        title:'M2 Money Supply',                 unit:'Bil.$',  color:'#ff8a65', freq:'Monthly',   desc:'M2 includes cash, checking, savings' },
+    { id:'BUSLOANS',    title:'Commercial & Industrial Loans',   unit:'Bil.$',  color:'#ffccbc', freq:'Monthly',   desc:'C&I loans at all commercial banks' },
+    { id:'DRSFRMACBS',  title:'Mortgage Delinquency Rate',       unit:'%',      color:'#bf360c', freq:'Quarterly', desc:'Single-family residential mortgages', isRate:true },
+  ],
+  global: [
+    { id:'BOPGSTB',    title:'Trade Balance',                    unit:'Mil.$',  color:'#00bcd4', freq:'Monthly',   desc:'Balance of goods & services trade' },
+    { id:'DTWEXBGS',   title:'US Dollar Index (Broad)',          unit:'Index',  color:'#0097a7', freq:'Daily',     desc:'US dollar vs broad basket of currencies' },
+    { id:'DCOILWTICO', title:'WTI Crude Oil Price',              unit:'$/bbl',  color:'#006064', freq:'Daily',     desc:'West Texas Intermediate crude oil' },
+    { id:'GOLDAMGBD228NLBM', title:'Gold Price (London Fix)',    unit:'$/oz',   color:'#80deea', freq:'Daily',     desc:'Gold London afternoon fixing price' },
+  ],
+};
+
+// ═══════════════════════════════════════════════════════════════
+// STATE
+// ═══════════════════════════════════════════════════════════════
+let apiKey    = '';
+let charts    = {};
+let dataSt    = {};
+let activeTab = 'inflation';
+let months    = 60;
+let loaded    = false;
+
+// ═══════════════════════════════════════════════════════════════
+// THEME
+// ═══════════════════════════════════════════════════════════════
+let theme = localStorage.getItem('fred-theme') || 'dark';
+applyTheme(theme);
+
+function toggleTheme() {
+  theme = theme === 'dark' ? 'light' : 'dark';
+  applyTheme(theme);
+  localStorage.setItem('fred-theme', theme);
   if (loaded) setTimeout(() => Object.values(SERIES).flat().forEach(s => { if (dataSt[s.id]) rebuildChart(s); }), 100);
 }
 
